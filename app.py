@@ -5,7 +5,6 @@ import threading
 import queue
 import yt_dlp
 import os
-import re
 import json
 from pathlib import Path
 
@@ -38,6 +37,37 @@ def save_last_directory(directory):
             json.dump({"last_directory": directory}, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def format_speed(speed):
+    if not speed:
+        return "N/A"
+    try:
+        value = float(speed)
+    except (TypeError, ValueError):
+        return "N/A"
+    units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    i = 0
+    while value >= 1024 and i < len(units) - 1:
+        value /= 1024
+        i += 1
+    return f"{value:.2f} {units[i]}"
+
+
+def format_eta(seconds):
+    if seconds is None:
+        return "N/A"
+    try:
+        seconds = int(seconds)
+    except (TypeError, ValueError):
+        return "N/A"
+    if seconds < 0:
+        return "N/A"
+    h, remainder = divmod(seconds, 3600)
+    m, s = divmod(remainder, 60)
+    if h:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 class DownloadCancelled(Exception):
@@ -253,22 +283,23 @@ class YouTubeDownloaderApp(ctk.CTk):
             if tmpfilename:
                 self._partial_files.add(tmpfilename)
 
-            percent_str = d.get('_percent_str', '0%').strip()
-            speed_str = d.get('_speed_str', 'N/A')
-            eta_str = d.get('_eta_str', 'N/A')
+            downloaded = d.get('downloaded_bytes') or 0
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
 
-            ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-            percent_str = ansi_escape.sub('', percent_str)
+            if total > 0:
+                percent_float = downloaded / total
+            else:
+                percent_float = 0.0
+            percent_float = max(0.0, min(1.0, percent_float))
 
-            try:
-                percent_float = float(percent_str.replace('%', '')) / 100
-            except ValueError:
-                percent_float = 0
+            percent_display = f"{percent_float * 100:.1f}%"
+            speed_display = format_speed(d.get('speed'))
+            eta_display = format_eta(d.get('eta'))
 
             self.progress_queue.put((
                 'progress',
                 percent_float,
-                f"Baixando: {percent_str} | Velocidade: {speed_str} | Restante: {eta_str}",
+                f"Baixando: {percent_display} | Velocidade: {speed_display} | Restante: {eta_display}",
             ))
 
         elif d['status'] == 'finished':
@@ -277,7 +308,7 @@ class YouTubeDownloaderApp(ctk.CTk):
                 self._partial_files.add(filename)
             self.progress_queue.put((
                 'processing',
-                None,
+                1.0,
                 "Download concluído. Processando com FFmpeg (mesclando/convertendo)...",
             ))
 
@@ -293,7 +324,10 @@ class YouTubeDownloaderApp(ctk.CTk):
                     self.update_status(text)
 
                 elif msg_type == 'processing':
-                    self.update_status(message[2])
+                    _, percent, text = message
+                    if percent is not None:
+                        self.progress_bar.set(percent)
+                    self.update_status(text)
 
                 elif msg_type == 'finished':
                     _, title, media_type = message
