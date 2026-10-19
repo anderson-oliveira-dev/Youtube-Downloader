@@ -16,6 +16,20 @@ CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
 
 PLAYLIST_DEFAULT_HEIGHTS = [1080, 720, 480, 360]
 
+VIDEO_CONTAINERS = ["MP4", "MKV", "WEBM", "AVI", "MOV"]
+
+AUDIO_QUALITY_OPTIONS = [
+    "MP3 - 320 kbps",
+    "MP3 - 192 kbps",
+    "MP3 - 128 kbps",
+    "M4A - 256 kbps",
+    "OPUS - 192 kbps",
+    "FLAC - Lossless",
+    "WAV - Lossless",
+]
+
+_CONTAINERS_PATTERN = "|".join(VIDEO_CONTAINERS)
+
 
 def get_default_directory():
     videos = Path.home() / "Videos"
@@ -78,7 +92,8 @@ def format_eta(seconds):
 def pick_best_option(options):
     if not options:
         return None
-    video_opts = [o for o in options if re.match(r"(MP4|AVI)\s*-\s*\d+p", o)]
+    video_pattern = r"(" + _CONTAINERS_PATTERN + r")\s*-\s*\d+p"
+    video_opts = [o for o in options if re.match(video_pattern, o)]
     if video_opts:
         def res(o):
             m = re.search(r"(\d+)p", o)
@@ -87,12 +102,15 @@ def pick_best_option(options):
         if mp4_opts:
             return max(mp4_opts, key=res)
         return max(video_opts, key=res)
-    audio_opts = [o for o in options if "kbps" in o]
+    audio_opts = [o for o in options if re.match(r"(MP3|M4A|OPUS)\s*-\s*\d+\s*kbps", o) or "Lossless" in o]
     if audio_opts:
-        def kbps(o):
-            m = re.search(r"(\d+)\s*kbps", o)
-            return int(m.group(1)) if m else 0
-        return max(audio_opts, key=kbps)
+        mp3_opts = [o for o in audio_opts if o.startswith("MP3")]
+        if mp3_opts:
+            def kbps(o):
+                m = re.search(r"(\d+)\s*kbps", o)
+                return int(m.group(1)) if m else 0
+            return max(mp3_opts, key=kbps)
+        return audio_opts[0]
     return options[0]
 
 
@@ -118,7 +136,7 @@ def resolve_output_path(info):
         if not fp:
             continue
         base, _ = os.path.splitext(fp)
-        for ext in (".mp3", ".mp4", ".mkv", ".webm", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav", ".avi"):
+        for ext in (".mp3", ".mp4", ".mkv", ".webm", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav", ".avi", ".mov"):
             alt = base + ext
             if os.path.exists(alt):
                 return alt
@@ -188,13 +206,13 @@ def collect_video_heights(formats):
 def build_video_quality_options(heights):
     options = []
     for h in heights:
-        options.append(f"MP4 - {h}p")
-        options.append(f"AVI - {h}p")
+        for c in VIDEO_CONTAINERS:
+            options.append(f"{c} - {h}p")
     return options
 
 
 def build_audio_quality_options():
-    return ["MP3 - 320 kbps", "MP3 - 192 kbps", "MP3 - 128 kbps"]
+    return list(AUDIO_QUALITY_OPTIONS)
 
 
 class ToolTip:
@@ -681,20 +699,42 @@ class YouTubeDownloaderApp(ctk.CTk):
         }
 
         if media_type == "Áudio":
-            bitrate = 192
-            m = re.search(r"(\d+)\s*kbps", quality or "")
-            if m:
-                bitrate = int(m.group(1))
-            opts.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': str(bitrate),
-                }],
-            })
+            if quality.endswith("Lossless"):
+                if quality.startswith("WAV"):
+                    codec = "wav"
+                else:
+                    codec = "flac"
+                opts.update({
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': codec,
+                    }],
+                })
+            else:
+                m = re.match(r"(MP3|M4A|OPUS)\s*-\s*(\d+)\s*kbps", quality or "")
+                if m:
+                    codec = m.group(1).lower()
+                    bitrate = m.group(2)
+                    opts.update({
+                        'format': 'bestaudio/best',
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': codec,
+                            'preferredquality': bitrate,
+                        }],
+                    })
+                else:
+                    opts.update({
+                        'format': 'bestaudio/best',
+                        'postprocessors': [{
+                            'key': 'FFmpegExtractAudio',
+                            'preferredcodec': 'mp3',
+                            'preferredquality': '192',
+                        }],
+                    })
         else:
-            m = re.match(r"(MP4|AVI)\s*-\s*(\d+)p", quality or "")
+            m = re.match(r"(" + _CONTAINERS_PATTERN + r")\s*-\s*(\d+)p", quality or "")
             if m:
                 container = m.group(1).lower()
                 height = int(m.group(2))
