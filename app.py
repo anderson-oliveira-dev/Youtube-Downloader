@@ -6,6 +6,8 @@ import queue
 import yt_dlp
 import os
 import json
+import sys
+import subprocess
 from pathlib import Path
 
 
@@ -70,6 +72,140 @@ def format_eta(seconds):
     return f"{m:02d}:{s:02d}"
 
 
+def resolve_output_path(info):
+    candidates = []
+    requested = info.get("requested_downloads") or []
+    for item in requested:
+        fp = item.get("filepath")
+        if fp:
+            candidates.append(fp)
+    for key in ("filepath", "_filename"):
+        fp = info.get(key)
+        if fp:
+            candidates.append(fp)
+
+    for fp in candidates:
+        if fp and os.path.exists(fp):
+            return fp
+
+    for fp in candidates:
+        if not fp:
+            continue
+        base, _ = os.path.splitext(fp)
+        for ext in (".mp3", ".mp4", ".mkv", ".webm", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav"):
+            alt = base + ext
+            if os.path.exists(alt):
+                return alt
+
+    return candidates[0] if candidates else None
+
+
+def reveal_in_explorer(filepath):
+    if not filepath:
+        return
+    if sys.platform == "win32":
+        if os.path.isfile(filepath):
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(filepath)])
+        else:
+            folder = filepath if os.path.isdir(filepath) else os.path.dirname(filepath)
+            if folder and os.path.isdir(folder):
+                os.startfile(folder)
+    elif sys.platform == "darwin":
+        if os.path.isfile(filepath):
+            subprocess.Popen(["open", "-R", filepath])
+        else:
+            folder = filepath if os.path.isdir(filepath) else os.path.dirname(filepath)
+            subprocess.Popen(["open", folder or "."])
+    else:
+        folder = filepath if os.path.isdir(filepath) else os.path.dirname(filepath)
+        if folder and os.path.isdir(folder):
+            subprocess.Popen(["xdg-open", folder])
+
+
+def open_with_default_app(filepath):
+    if not filepath or not os.path.exists(filepath):
+        raise FileNotFoundError(filepath)
+    if sys.platform == "win32":
+        os.startfile(filepath)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", filepath])
+    else:
+        subprocess.Popen(["xdg-open", filepath])
+
+
+class ToolTip:
+    def __init__(self, widget, text, delay=400):
+        self.widget = widget
+        self.text = text
+        self.delay = delay
+        self.tip_window = None
+        self._after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._on_destroy, add="+")
+
+    def _schedule(self, event=None):
+        self._cancel()
+        try:
+            self._after_id = self.widget.after(self.delay, self._show)
+        except Exception:
+            self._after_id = None
+
+    def _cancel(self):
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        self._after_id = None
+        if self.tip_window:
+            return
+        try:
+            if not self.widget.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_attributes("-topmost", True)
+            label = tk.Label(
+                tw, text=self.text,
+                background="#2B2B2B", foreground="#E5E7EB",
+                relief="solid", borderwidth=1,
+                font=("Segoe UI", 9), padx=6, pady=3,
+            )
+            label.pack()
+            tip_w = tw.winfo_reqwidth()
+            x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2 - tip_w // 2
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            tw.wm_geometry(f"+{x}+{y}")
+            self.tip_window = tw
+        except Exception:
+            if self.tip_window:
+                try:
+                    self.tip_window.destroy()
+                except Exception:
+                    pass
+            self.tip_window = None
+
+    def _hide(self, event=None):
+        self._cancel()
+        if self.tip_window:
+            try:
+                self.tip_window.destroy()
+            except Exception:
+                pass
+            self.tip_window = None
+
+    def _on_destroy(self, event=None):
+        self._hide()
+
+
 class DownloadCancelled(Exception):
     pass
 
@@ -87,6 +223,10 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.downloading = False
         self.cancel_event = threading.Event()
         self._partial_files = set()
+        self.history_files = {}
+        self.action_buttons = {}
+        self.tooltips = []
+        self._refresh_scheduled = None
 
         self.create_widgets()
         self.check_queue()
@@ -141,12 +281,27 @@ class YouTubeDownloaderApp(ctk.CTk):
         history_frame = ctk.CTkFrame(self)
         history_frame.pack(pady=10, padx=20, fill="both", expand=True)
 
-        columns = ("Título", "Tipo", "Qualidade", "Status")
+        try:
+            style = ttk.Style()
+            style.configure("Treeview", rowheight=32)
+        except Exception:
+            pass
+
+        columns = ("Título", "Tipo", "Qualidade", "Status", "Ações")
         self.history_table = ttk.Treeview(history_frame, columns=columns, show="headings", height=8)
         for col in columns:
             self.history_table.heading(col, text=col)
-            self.history_table.column(col, width=150, anchor="w")
+            if col == "Ações":
+                self.history_table.column(col, width=110, minwidth=90, anchor="center", stretch=False)
+            else:
+                self.history_table.column(col, width=150, anchor="w")
         self.history_table.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self.history_table.bind("<Configure>", self._schedule_refresh)
+        self.history_table.bind("<MouseWheel>", self._schedule_refresh)
+        self.history_table.bind("<Button-4>", self._schedule_refresh)
+        self.history_table.bind("<Button-5>", self._schedule_refresh)
+        self.history_table.bind("<Double-1>", self._on_history_double_click)
 
     def set_controls_enabled(self, enabled):
         state = "normal" if enabled else "disabled"
@@ -254,7 +409,8 @@ class YouTubeDownloaderApp(ctk.CTk):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 title = info.get('title', 'Desconhecido')
-                self.progress_queue.put(('finished', title, media_type))
+                filepath = resolve_output_path(info)
+                self.progress_queue.put(('finished', title, media_type, filepath))
         except DownloadCancelled:
             self._cleanup_partial_files()
             self.progress_queue.put(('cancelled', None, None))
@@ -330,10 +486,10 @@ class YouTubeDownloaderApp(ctk.CTk):
                     self.update_status(text)
 
                 elif msg_type == 'finished':
-                    _, title, media_type = message
+                    _, title, media_type, filepath = message
                     self.progress_bar.set(1)
                     self.update_status(f"Download de '{title}' concluído com sucesso!")
-                    self.add_to_history(title, media_type, "Concluído")
+                    self.add_to_history(title, media_type, "Concluído", filepath)
                     self._partial_files.clear()
                     self.download_button.configure(state="normal")
                     self.reset_download_state()
@@ -363,12 +519,123 @@ class YouTubeDownloaderApp(ctk.CTk):
         color = "#FF5555" if is_error else "#FFFFFF"
         self.status_label.configure(text=text, text_color=color)
 
-    def add_to_history(self, title, media_type, status):
+    def add_to_history(self, title, media_type, status, filepath=None):
         display_type = media_type if media_type in ("Áudio", "Vídeo") else self._friendly_type()
-        self.history_table.insert(
+        item_id = self.history_table.insert(
             "", 0,
-            values=(title, display_type, self.quality_combobox.get(), status)
+            values=(title, display_type, self.quality_combobox.get(), status, "")
         )
+        if filepath:
+            self.history_files[item_id] = filepath
+        self.after_idle(self._refresh_action_buttons)
+
+    def _schedule_refresh(self, event=None):
+        if self._refresh_scheduled:
+            try:
+                self.after_cancel(self._refresh_scheduled)
+            except Exception:
+                pass
+        self._refresh_scheduled = self.after(30, self._do_refresh)
+
+    def _do_refresh(self):
+        self._refresh_scheduled = None
+        self._refresh_action_buttons()
+
+    def _refresh_action_buttons(self):
+        for btns in self.action_buttons.values():
+            for b in btns:
+                try:
+                    b.destroy()
+                except Exception:
+                    pass
+        self.action_buttons.clear()
+        self.tooltips.clear()
+
+        try:
+            items = self.history_table.get_children()
+        except Exception:
+            return
+
+        for item in items:
+            filepath = self.history_files.get(item)
+            if not filepath:
+                continue
+            try:
+                bbox = self.history_table.bbox(item, "Ações")
+            except Exception:
+                bbox = None
+            if not bbox or len(bbox) < 4:
+                continue
+            x, y, w, h = bbox
+            if w <= 0 or h <= 0:
+                continue
+
+            half = w // 2
+            btn_h = max(min(h - 4, 28), 20)
+
+            folder_btn = ctk.CTkButton(
+                self.history_table,
+                text="📂", width=half - 4, height=btn_h,
+                font=("Segoe UI Emoji", 12),
+                corner_radius=4,
+                fg_color="#3B82F6", hover_color="#2563EB",
+                text_color="#FFFFFF",
+                command=lambda p=filepath: self._open_folder(p),
+            )
+            folder_btn.place(x=x + 2, y=y + (h - btn_h) // 2, anchor="nw")
+
+            play_btn = ctk.CTkButton(
+                self.history_table,
+                text="▶", width=half - 4, height=btn_h,
+                font=("Segoe UI Emoji", 12),
+                corner_radius=4,
+                fg_color="#10B981", hover_color="#059669",
+                text_color="#FFFFFF",
+                command=lambda p=filepath: self._open_file(p),
+            )
+            play_btn.place(x=x + half + 1, y=y + (h - btn_h) // 2, anchor="nw")
+
+            self.action_buttons[item] = (folder_btn, play_btn)
+            self.tooltips.append(ToolTip(folder_btn, "Abrir pasta do arquivo"))
+            self.tooltips.append(ToolTip(play_btn, "Abrir o arquivo"))
+
+    def _open_folder(self, filepath):
+        try:
+            reveal_in_explorer(filepath)
+        except Exception as e:
+            self.update_status(f"Erro ao abrir local: {e}", is_error=True)
+
+    def _open_file(self, filepath):
+        if not os.path.isfile(filepath):
+            self.update_status("Arquivo não encontrado.", is_error=True)
+            return
+        try:
+            open_with_default_app(filepath)
+        except Exception as e:
+            self.update_status(f"Erro ao abrir arquivo: {e}", is_error=True)
+
+    def _on_history_double_click(self, event):
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            widget = None
+        while widget is not None:
+            if isinstance(widget, ctk.CTkButton):
+                return
+            if widget is self.history_table:
+                break
+            widget = getattr(widget, "master", None)
+
+        row_id = self.history_table.identify_row(event.y)
+        if not row_id:
+            return
+        filepath = self.history_files.get(row_id)
+        if not filepath or not os.path.isfile(filepath):
+            return
+        try:
+            open_with_default_app(filepath)
+        except Exception as e:
+            self.update_status(f"Erro ao abrir arquivo: {e}", is_error=True)
 
 
 if __name__ == "__main__":
