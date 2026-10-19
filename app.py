@@ -6,6 +6,38 @@ import queue
 import yt_dlp
 import os
 import re
+import json
+from pathlib import Path
+
+
+CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
+
+
+def get_default_directory():
+    videos = Path.home() / "Videos"
+    if videos.exists() and videos.is_dir():
+        return str(videos)
+    return str(Path.home())
+
+
+def load_last_directory():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        path = data.get("last_directory")
+        if path and os.path.isdir(path):
+            return path
+    except Exception:
+        pass
+    return get_default_directory()
+
+
+def save_last_directory(directory):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump({"last_directory": directory}, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 class DownloadCancelled(Exception):
@@ -37,6 +69,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.dir_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
         self.dir_entry = ctk.CTkEntry(config_frame, width=400, placeholder_text="Selecione a pasta...")
         self.dir_entry.grid(row=0, column=1, padx=10, pady=10)
+        self.dir_entry.insert(0, load_last_directory())
         self.dir_button = ctk.CTkButton(config_frame, text="Procurar", width=100, command=self.select_directory)
         self.dir_button.grid(row=0, column=2, padx=10, pady=10)
 
@@ -113,10 +146,12 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.set_button_start_mode()
 
     def select_directory(self):
-        directory = filedialog.askdirectory()
+        initial = self.dir_entry.get().strip() or load_last_directory()
+        directory = filedialog.askdirectory(initialdir=initial)
         if directory:
             self.dir_entry.delete(0, tk.END)
             self.dir_entry.insert(0, directory)
+            save_last_directory(directory)
 
     def toggle_download(self):
         if self.downloading:
@@ -135,6 +170,12 @@ class YouTubeDownloaderApp(ctk.CTk):
         if not url or not directory:
             self.update_status("Erro: URL e pasta de destino são obrigatórios.", is_error=True)
             return
+
+        if not os.path.isdir(directory):
+            self.update_status("Erro: pasta de destino não existe.", is_error=True)
+            return
+
+        save_last_directory(directory)
 
         self.cancel_event.clear()
         self._partial_files.clear()
