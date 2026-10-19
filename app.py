@@ -624,10 +624,63 @@ class YouTubeDownloaderApp(ctk.CTk):
         )
         download_thread.start()
 
-    def download_video(self, url, directory, quality, media_type):
-        ydl_opts = {
+    def _make_progress_hook(self, idx=None, total=None):
+        def hook(d):
+            if self.cancel_event.is_set():
+                raise DownloadCancelled()
+
+            if d['status'] == 'downloading':
+                filename = d.get('filename')
+                tmpfilename = d.get('tmpfilename')
+                if filename:
+                    self._partial_files.add(filename)
+                if tmpfilename:
+                    self._partial_files.add(tmpfilename)
+
+                downloaded = d.get('downloaded_bytes') or 0
+                total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+
+                if total_bytes > 0:
+                    percent_float = downloaded / total_bytes
+                else:
+                    percent_float = 0.0
+                percent_float = max(0.0, min(1.0, percent_float))
+
+                percent_display = f"{percent_float * 100:.1f}%"
+                speed_display = format_speed(d.get('speed'))
+                eta_display = format_eta(d.get('eta'))
+
+                item_title = (d.get('info_dict') or {}).get('title') or ''
+                if len(item_title) > 35:
+                    item_title = item_title[:32] + "..."
+
+                if idx is not None and total is not None:
+                    prefix = f"[{idx}/{total}] "
+                else:
+                    prefix = ""
+                if item_title:
+                    prefix += f"{item_title}: "
+
+                self.progress_queue.put((
+                    'progress',
+                    percent_float,
+                    f"{prefix}Baixando: {percent_display} | Velocidade: {speed_display} | Restante: {eta_display}",
+                ))
+
+            elif d['status'] == 'finished':
+                filename = d.get('filename')
+                if filename:
+                    self._partial_files.add(filename)
+                self.progress_queue.put((
+                    'processing',
+                    1.0,
+                    "Processando com FFmpeg (mesclando/convertendo)...",
+                ))
+        return hook
+
+    def _build_ydl_opts(self, directory, quality, media_type):
+        opts = {
             'outtmpl': os.path.join(directory, '%(title)s.%(ext)s'),
-            'progress_hooks': [self.progress_hook],
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
@@ -641,7 +694,7 @@ class YouTubeDownloaderApp(ctk.CTk):
             m = re.search(r"(\d+)\s*kbps", quality or "")
             if m:
                 bitrate = int(m.group(1))
-            ydl_opts.update({
+            opts.update({
                 'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
@@ -654,49 +707,111 @@ class YouTubeDownloaderApp(ctk.CTk):
             if m:
                 container = m.group(1).lower()
                 height = int(m.group(2))
-                ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
-                ydl_opts['merge_output_format'] = container
-                ydl_opts['postprocessors'] = [{
+                opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+                opts['merge_output_format'] = container
+                opts['postprocessors'] = [{
                     'key': 'FFmpegVideoConvertor',
                     'preferedformat': container,
                 }]
             else:
-                ydl_opts['format'] = 'bestvideo+bestaudio/best'
-                ydl_opts['merge_output_format'] = 'mp4'
+                opts['format'] = 'bestvideo+bestaudio/best'
+                opts['merge_output_format'] = 'mp4'
 
+        return opts
+
+    def download_video(self, url, directory, quality, media_type):
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-
-            if info is None:
-                self.progress_queue.put(('error', 'Falha ao processar o link.', None))
-                return
-
-            if is_playlist_info(info):
-                entries = info.get('entries') or []
-                playlist_title = info.get('title') or 'Playlist'
-                success = 0
-                total = 0
-                for entry in entries:
-                    if not entry:
-                        continue
-                    total += 1
-                    title = entry.get('title') or 'Desconhecido'
-                    filepath = resolve_output_path(entry)
-                    if filepath:
-                        success += 1
-                    self.progress_queue.put(('item_finished', title, media_type, filepath))
-                self.progress_queue.put(('playlist_finished', playlist_title, success, total))
-            else:
-                title = info.get('title', 'Desconhecido')
-                filepath = resolve_output_path(info)
-                self.progress_queue.put(('finished', title, media_type, filepath))
-        except DownloadCancelled:
-            self._cleanup_partial_files()
-            self.progress_queue.put(('cancelled', None, None))
+            flat_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'extract_flat': 'in_playlist',
+                'extractor_args': EXTRACTOR_ARGS,
+                'force_ipv4': True,
+            }
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
         except Exception as e:
             self._cleanup_partial_files()
             self.progress_queue.put(('error', str(e), None))
+            return
+
+        if info is None:
+            self.progress_queue.put(('error', 'Falha ao processar o link.', None))
+            return
+
+        base_opts = self._build_ydl_opts(directory, quality, media_type)
+
+        if not is_playlist_info(info):
+            self._partial_files.clear()
+            opts = dict(base_opts)
+            opts['progress_hooks'] = [self._make_progress_hook()]
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    result = ydl.extract_info(url, download=True)
+                title = (result or {}).get('title', 'Desconhecido')
+                filepath = resolve_output_path(result)
+                self.progress_queue.put(('finished', title, media_type, filepath))
+            except DownloadCancelled:
+                self._cleanup_partial_files()
+                self.progress_queue.put(('cancelled', None, None))
+            except Exception as e:
+                self._cleanup_partial_files()
+                self.progress_queue.put(('error', str(e), None))
+            return
+
+        entries = [e for e in (info.get('entries') or []) if e]
+        playlist_title = info.get('title') or 'Playlist'
+        total = len(entries)
+        success = 0
+        was_cancelled = False
+
+        self.progress_queue.put(('playlist_started', playlist_title, total))
+
+        for idx, entry in enumerate(entries, 1):
+            if self.cancel_event.is_set():
+                was_cancelled = True
+                break
+
+            entry_url = entry.get('url') or entry.get('webpage_url')
+            entry_title = entry.get('title') or f'Item {idx}'
+
+            if not entry_url:
+                self.progress_queue.put(('item_finished', entry_title, media_type, None, idx, total))
+                continue
+
+            self._partial_files.clear()
+            self.progress_queue.put(('item_started', entry_title, idx, total))
+
+            opts = dict(base_opts)
+            opts['progress_hooks'] = [self._make_progress_hook(idx, total)]
+
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    result = ydl.extract_info(entry_url, download=True)
+
+                filepath = resolve_output_path(result)
+                if filepath:
+                    success += 1
+
+                if self.cancel_event.is_set():
+                    self.progress_queue.put(('item_finished', entry_title, media_type, filepath, idx, total))
+                    was_cancelled = True
+                    break
+
+                self.progress_queue.put(('item_finished', entry_title, media_type, filepath, idx, total))
+            except DownloadCancelled:
+                self._cleanup_partial_files()
+                was_cancelled = True
+                break
+            except Exception:
+                self._cleanup_partial_files()
+                self.progress_queue.put(('item_finished', entry_title, media_type, None, idx, total))
+
+        if was_cancelled or self.cancel_event.is_set():
+            self.progress_queue.put(('cancelled', None, None))
+        else:
+            self.progress_queue.put(('playlist_finished', playlist_title, success, total))
 
     def _cleanup_partial_files(self):
         for filepath in list(self._partial_files):
@@ -706,52 +821,6 @@ class YouTubeDownloaderApp(ctk.CTk):
             except Exception:
                 pass
         self._partial_files.clear()
-
-    def progress_hook(self, d):
-        if self.cancel_event.is_set():
-            raise DownloadCancelled()
-
-        if d['status'] == 'downloading':
-            filename = d.get('filename')
-            tmpfilename = d.get('tmpfilename')
-            if filename:
-                self._partial_files.add(filename)
-            if tmpfilename:
-                self._partial_files.add(tmpfilename)
-
-            downloaded = d.get('downloaded_bytes') or 0
-            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-
-            if total > 0:
-                percent_float = downloaded / total
-            else:
-                percent_float = 0.0
-            percent_float = max(0.0, min(1.0, percent_float))
-
-            percent_display = f"{percent_float * 100:.1f}%"
-            speed_display = format_speed(d.get('speed'))
-            eta_display = format_eta(d.get('eta'))
-
-            item_title = (d.get('info_dict') or {}).get('title') or ''
-            if len(item_title) > 40:
-                item_title = item_title[:37] + "..."
-            prefix = f"[{item_title}] " if item_title else ""
-
-            self.progress_queue.put((
-                'progress',
-                percent_float,
-                f"{prefix}Baixando: {percent_display} | Velocidade: {speed_display} | Restante: {eta_display}",
-            ))
-
-        elif d['status'] == 'finished':
-            filename = d.get('filename')
-            if filename:
-                self._partial_files.add(filename)
-            self.progress_queue.put((
-                'processing',
-                1.0,
-                "Processando item com FFmpeg (mesclando/convertendo)...",
-            ))
 
     def check_queue(self):
         try:
@@ -779,11 +848,20 @@ class YouTubeDownloaderApp(ctk.CTk):
                     self.download_button.configure(state="normal")
                     self.reset_download_state()
 
+                elif msg_type == 'playlist_started':
+                    _, playlist_title, total = message
+                    self.progress_bar.set(0)
+                    self.update_status(f"Iniciando playlist '{playlist_title}' ({total} itens)...")
+
+                elif msg_type == 'item_started':
+                    _, entry_title, idx, total = message
+                    self.update_status(f"[{idx}/{total}] Preparando: {entry_title}")
+
                 elif msg_type == 'item_finished':
-                    _, title, media_type, filepath = message
+                    _, title, media_type, filepath, idx, total = message
                     status = "Concluído" if filepath else "Falhou"
                     self.add_to_history(title, media_type, status, filepath)
-                    self.update_status(f"Baixado: {title}")
+                    self.update_status(f"[{idx}/{total}] {status}: {title}")
 
                 elif msg_type == 'playlist_finished':
                     _, playlist_title, success, total = message
