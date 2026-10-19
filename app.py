@@ -14,6 +14,14 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
 
+EXTRACTOR_ARGS = {
+    'youtube': {
+        'player_client': ['web_safari', 'android', 'tv', 'mweb']
+    }
+}
+
+PLAYLIST_DEFAULT_HEIGHTS = [1080, 720, 480, 360]
+
 
 def get_default_directory():
     videos = Path.home() / "Videos"
@@ -73,7 +81,30 @@ def format_eta(seconds):
     return f"{m:02d}:{s:02d}"
 
 
+def pick_best_option(options):
+    if not options:
+        return None
+    video_opts = [o for o in options if re.match(r"(MP4|AVI)\s*-\s*\d+p", o)]
+    if video_opts:
+        def res(o):
+            m = re.search(r"(\d+)p", o)
+            return int(m.group(1)) if m else 0
+        mp4_opts = [o for o in video_opts if o.startswith("MP4")]
+        if mp4_opts:
+            return max(mp4_opts, key=res)
+        return max(video_opts, key=res)
+    audio_opts = [o for o in options if "kbps" in o]
+    if audio_opts:
+        def kbps(o):
+            m = re.search(r"(\d+)\s*kbps", o)
+            return int(m.group(1)) if m else 0
+        return max(audio_opts, key=kbps)
+    return options[0]
+
+
 def resolve_output_path(info):
+    if not info:
+        return None
     candidates = []
     requested = info.get("requested_downloads") or []
     for item in requested:
@@ -141,6 +172,12 @@ def is_youtube_music_url(url):
 def is_youtube_music_info(info):
     ext_key = (info.get("extractor_key") or "").lower()
     return "youtubemusic" in ext_key
+
+
+def is_playlist_info(info):
+    if not info:
+        return False
+    return info.get("_type") == "playlist" or "entries" in info
 
 
 def collect_video_heights(formats):
@@ -264,6 +301,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         self._refresh_scheduled = None
         self.video_formats = None
         self.audio_formats = None
+        self.current_is_playlist = False
 
         self.create_widgets()
         self.check_queue()
@@ -407,31 +445,78 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.quality_combobox.configure(state="disabled", values=["Analisando..."])
         self.quality_combobox.set("Analisando...")
         self.download_button.configure(state="disabled")
-        self.update_status("Buscando informações do vídeo...")
+        self.update_status("Buscando informações do link...")
 
         thread = threading.Thread(target=self._analyze_url, args=(url,), daemon=True)
         thread.start()
 
     def _analyze_url(self, url):
         try:
-            ydl_opts = {
+            flat_opts = {
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
+                'extract_flat': 'in_playlist',
+                'extractor_args': EXTRACTOR_ARGS,
+                'force_ipv4': True,
             }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
 
-            is_music = is_youtube_music_url(url) or is_youtube_music_info(info)
+            if info is None:
+                self.analysis_queue.put({"ok": False, "error": "Não foi possível obter informações do link."})
+                return
 
-            formats = info.get("formats") or []
-            heights = collect_video_heights(formats)
+            is_music = is_youtube_music_url(url) or is_youtube_music_info(info)
+            playlist = is_playlist_info(info)
+
+            if playlist:
+                entries = list(info.get("entries") or [])
+                entry_count = len(entries)
+                playlist_title = info.get("title") or "Playlist"
+
+                heights = []
+                if entries:
+                    first_url = entries[0].get("url") or entries[0].get("webpage_url")
+                    if first_url:
+                        try:
+                            single_opts = {
+                                'quiet': True,
+                                'no_warnings': True,
+                                'skip_download': True,
+                                'extractor_args': EXTRACTOR_ARGS,
+                                'force_ipv4': True,
+                            }
+                            with yt_dlp.YoutubeDL(single_opts) as ydl2:
+                                first_info = ydl2.extract_info(first_url, download=False)
+                            if first_info:
+                                heights = collect_video_heights(first_info.get("formats") or [])
+                        except Exception:
+                            heights = []
+
+                if not heights:
+                    heights = list(PLAYLIST_DEFAULT_HEIGHTS)
+
+                result = {
+                    "ok": True,
+                    "is_playlist": True,
+                    "is_music": is_music,
+                    "heights": heights,
+                    "video_options": build_video_quality_options(heights),
+                    "audio_options": build_audio_quality_options(),
+                    "title": f"{playlist_title} ({entry_count} itens)",
+                }
+                self.analysis_queue.put(result)
+                return
 
             result = {
                 "ok": True,
+                "is_playlist": False,
                 "is_music": is_music,
-                "heights": heights,
-                "video_options": build_video_quality_options(heights),
+                "heights": [],
+                "video_options": build_video_quality_options(
+                    collect_video_heights(info.get("formats") or [])
+                ),
                 "audio_options": build_audio_quality_options(),
                 "title": info.get("title") or "Título desconhecido",
             }
@@ -463,13 +548,16 @@ class YouTubeDownloaderApp(ctk.CTk):
 
         self.video_formats = result.get("video_options") or []
         self.audio_formats = result.get("audio_options") or []
+        self.current_is_playlist = result.get("is_playlist", False)
 
         if result.get("is_music"):
             self.type_var.set("Áudio")
-            self.update_status(f"YouTube Music detectado: {result.get('title')}. Modo Áudio ativado.")
+            prefix = "Playlist de música" if self.current_is_playlist else "YouTube Music"
+            self.update_status(f"{prefix} detectado: {result.get('title')}. Modo Áudio ativado.")
         else:
             self.type_var.set("Vídeo")
-            self.update_status(f"Link analisado: {result.get('title')}")
+            prefix = "Playlist" if self.current_is_playlist else "Link"
+            self.update_status(f"{prefix} analisado: {result.get('title')}")
 
         self.type_switch.configure(state="normal")
         self._on_type_changed()
@@ -484,9 +572,11 @@ class YouTubeDownloaderApp(ctk.CTk):
         if not options:
             options = ["Nenhuma opção disponível"]
 
-        self.quality_combobox.configure(values=options)
-        self.quality_combobox.set(options[0] if options else "Nenhuma opção disponível")
+        best = pick_best_option(options) or options[0]
+
         self.quality_combobox.configure(state="normal")
+        self.quality_combobox.configure(values=options)
+        self.quality_combobox.set(best)
         self.download_button.configure(state="normal")
 
     def toggle_download(self):
@@ -540,6 +630,10 @@ class YouTubeDownloaderApp(ctk.CTk):
             'progress_hooks': [self.progress_hook],
             'quiet': True,
             'no_warnings': True,
+            'ignoreerrors': True,
+            'extractor_args': EXTRACTOR_ARGS,
+            'force_ipv4': True,
+            'sleep_interval': 2,
         }
 
         if media_type == "Áudio":
@@ -573,6 +667,27 @@ class YouTubeDownloaderApp(ctk.CTk):
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
+
+            if info is None:
+                self.progress_queue.put(('error', 'Falha ao processar o link.', None))
+                return
+
+            if is_playlist_info(info):
+                entries = info.get('entries') or []
+                playlist_title = info.get('title') or 'Playlist'
+                success = 0
+                total = 0
+                for entry in entries:
+                    if not entry:
+                        continue
+                    total += 1
+                    title = entry.get('title') or 'Desconhecido'
+                    filepath = resolve_output_path(entry)
+                    if filepath:
+                        success += 1
+                    self.progress_queue.put(('item_finished', title, media_type, filepath))
+                self.progress_queue.put(('playlist_finished', playlist_title, success, total))
+            else:
                 title = info.get('title', 'Desconhecido')
                 filepath = resolve_output_path(info)
                 self.progress_queue.put(('finished', title, media_type, filepath))
@@ -617,10 +732,15 @@ class YouTubeDownloaderApp(ctk.CTk):
             speed_display = format_speed(d.get('speed'))
             eta_display = format_eta(d.get('eta'))
 
+            item_title = (d.get('info_dict') or {}).get('title') or ''
+            if len(item_title) > 40:
+                item_title = item_title[:37] + "..."
+            prefix = f"[{item_title}] " if item_title else ""
+
             self.progress_queue.put((
                 'progress',
                 percent_float,
-                f"Baixando: {percent_display} | Velocidade: {speed_display} | Restante: {eta_display}",
+                f"{prefix}Baixando: {percent_display} | Velocidade: {speed_display} | Restante: {eta_display}",
             ))
 
         elif d['status'] == 'finished':
@@ -630,7 +750,7 @@ class YouTubeDownloaderApp(ctk.CTk):
             self.progress_queue.put((
                 'processing',
                 1.0,
-                "Download concluído. Processando com FFmpeg (mesclando/convertendo)...",
+                "Processando item com FFmpeg (mesclando/convertendo)...",
             ))
 
     def check_queue(self):
@@ -655,6 +775,22 @@ class YouTubeDownloaderApp(ctk.CTk):
                     self.progress_bar.set(1)
                     self.update_status(f"Download de '{title}' concluído com sucesso!")
                     self.add_to_history(title, media_type, "Concluído", filepath)
+                    self._partial_files.clear()
+                    self.download_button.configure(state="normal")
+                    self.reset_download_state()
+
+                elif msg_type == 'item_finished':
+                    _, title, media_type, filepath = message
+                    status = "Concluído" if filepath else "Falhou"
+                    self.add_to_history(title, media_type, status, filepath)
+                    self.update_status(f"Baixado: {title}")
+
+                elif msg_type == 'playlist_finished':
+                    _, playlist_title, success, total = message
+                    self.progress_bar.set(1)
+                    self.update_status(
+                        f"Playlist '{playlist_title}' concluída: {success}/{total} itens baixados."
+                    )
                     self._partial_files.clear()
                     self.download_button.configure(state="normal")
                     self.reset_download_state()
