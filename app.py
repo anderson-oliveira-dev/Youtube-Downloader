@@ -17,6 +17,9 @@ CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
 EXTRACTOR_ARGS = {
     'youtube': {
         'player_client': ['web_safari', 'android', 'tv', 'mweb']
+    },
+    'youtubepot-bgutilscript': {
+        'script_path': r'C:\Users\Usuário 1\bgutil-ytdlp-pot-provider\server\src\generate_once.ts'
     }
 }
 
