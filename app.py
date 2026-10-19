@@ -8,6 +8,7 @@ import os
 import json
 import sys
 import subprocess
+import re
 from pathlib import Path
 
 
@@ -92,7 +93,7 @@ def resolve_output_path(info):
         if not fp:
             continue
         base, _ = os.path.splitext(fp)
-        for ext in (".mp3", ".mp4", ".mkv", ".webm", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav"):
+        for ext in (".mp3", ".mp4", ".mkv", ".webm", ".m4a", ".opus", ".ogg", ".aac", ".flac", ".wav", ".avi"):
             alt = base + ext
             if os.path.exists(alt):
                 return alt
@@ -131,6 +132,38 @@ def open_with_default_app(filepath):
         subprocess.Popen(["open", filepath])
     else:
         subprocess.Popen(["xdg-open", filepath])
+
+
+def is_youtube_music_url(url):
+    return bool(re.search(r"music\.youtube\.com", url or "", re.IGNORECASE))
+
+
+def is_youtube_music_info(info):
+    ext_key = (info.get("extractor_key") or "").lower()
+    return "youtubemusic" in ext_key
+
+
+def collect_video_heights(formats):
+    heights = set()
+    for f in formats:
+        if f.get("vcodec") == "none":
+            continue
+        h = f.get("height")
+        if isinstance(h, (int, float)) and h > 0:
+            heights.add(int(h))
+    return sorted(heights, reverse=True)
+
+
+def build_video_quality_options(heights):
+    options = []
+    for h in heights:
+        options.append(f"MP4 - {h}p")
+        options.append(f"AVI - {h}p")
+    return options
+
+
+def build_audio_quality_options():
+    return ["MP3 - 320 kbps", "MP3 - 192 kbps", "MP3 - 128 kbps"]
 
 
 class ToolTip:
@@ -215,21 +248,26 @@ class YouTubeDownloaderApp(ctk.CTk):
         super().__init__()
 
         self.title("YouTube Downloader Pro")
-        self.geometry("900x700")
+        self.geometry("900x760")
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
 
         self.progress_queue = queue.Queue()
+        self.analysis_queue = queue.Queue()
         self.downloading = False
+        self.analyzing = False
         self.cancel_event = threading.Event()
         self._partial_files = set()
         self.history_files = {}
         self.action_buttons = {}
         self.tooltips = []
         self._refresh_scheduled = None
+        self.video_formats = None
+        self.audio_formats = None
 
         self.create_widgets()
         self.check_queue()
+        self.check_analysis_queue()
 
     def create_widgets(self):
         config_frame = ctk.CTkFrame(self)
@@ -246,22 +284,35 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.url_label = ctk.CTkLabel(config_frame, text="URL do Vídeo:")
         self.url_label.grid(row=1, column=0, padx=10, pady=10, sticky="w")
         self.url_entry = ctk.CTkEntry(config_frame, width=400, placeholder_text="Cole a URL do YouTube aqui")
-        self.url_entry.grid(row=1, column=1, padx=10, pady=10, columnspan=2, sticky="w")
+        self.url_entry.grid(row=1, column=1, padx=10, pady=10, sticky="w")
+        self.url_entry.bind("<Control-v>", self._on_url_paste)
+        self.url_entry.bind("<Control-V>", self._on_url_paste)
+
+        self.analyze_button = ctk.CTkButton(
+            config_frame, text="Analisar Link", width=110,
+            command=self.start_analysis_thread
+        )
+        self.analyze_button.grid(row=1, column=2, padx=10, pady=10)
 
         self.quality_label = ctk.CTkLabel(config_frame, text="Qualidade:")
         self.quality_label.grid(row=2, column=0, padx=10, pady=10, sticky="w")
-        self.quality_combobox = ctk.CTkComboBox(config_frame, values=["Melhor", "1080p", "720p", "480p", "360p"])
+        self.quality_combobox = ctk.CTkComboBox(config_frame, values=["Aguardando análise..."])
         self.quality_combobox.grid(row=2, column=1, padx=10, pady=10, sticky="w")
-        self.quality_combobox.set("Melhor")
+        self.quality_combobox.set("Aguardando análise...")
 
-        self.type_var = tk.StringVar(value="video")
-        self.type_switch = ctk.CTkSegmentedButton(config_frame, values=["Vídeo", "Áudio"], variable=self.type_var)
+        self.type_var = tk.StringVar(value="Vídeo")
+        self.type_switch = ctk.CTkSegmentedButton(
+            config_frame, values=["Vídeo", "Áudio"],
+            variable=self.type_var, command=self._on_type_changed,
+            state="disabled"
+        )
         self.type_switch.grid(row=2, column=2, padx=10, pady=10, sticky="e")
 
         self.download_button = ctk.CTkButton(
             self, text="INICIAR DOWNLOAD", height=50,
             font=("Arial", 16, "bold"),
-            command=self.toggle_download
+            command=self.toggle_download,
+            state="disabled"
         )
         self.download_button.pack(pady=10, padx=20, fill="x")
 
@@ -275,7 +326,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.progress_bar.pack(pady=(10, 5), padx=10, fill="x")
         self.progress_bar.set(0)
 
-        self.status_label = ctk.CTkLabel(progress_frame, text="Aguardando...", anchor="w")
+        self.status_label = ctk.CTkLabel(progress_frame, text="Cole um link e clique em 'Analisar Link'.", anchor="w")
         self.status_label.pack(pady=(0, 10), padx=10, fill="x")
 
         history_frame = ctk.CTkFrame(self)
@@ -308,6 +359,7 @@ class YouTubeDownloaderApp(ctk.CTk):
         self.dir_entry.configure(state=state)
         self.dir_button.configure(state=state)
         self.url_entry.configure(state=state)
+        self.analyze_button.configure(state=state)
         self.quality_combobox.configure(state=state)
         self.type_switch.configure(state=state)
 
@@ -338,6 +390,105 @@ class YouTubeDownloaderApp(ctk.CTk):
             self.dir_entry.insert(0, directory)
             save_last_directory(directory)
 
+    def _on_url_paste(self, event=None):
+        self.after(50, self.start_analysis_thread)
+
+    def start_analysis_thread(self):
+        if self.analyzing:
+            return
+        url = self.url_entry.get().strip()
+        if not url:
+            self.update_status("Erro: cole uma URL válida primeiro.", is_error=True)
+            return
+
+        self.analyzing = True
+        self.analyze_button.configure(state="disabled", text="Analisando...")
+        self.type_switch.configure(state="disabled")
+        self.quality_combobox.configure(state="disabled", values=["Analisando..."])
+        self.quality_combobox.set("Analisando...")
+        self.download_button.configure(state="disabled")
+        self.update_status("Buscando informações do vídeo...")
+
+        thread = threading.Thread(target=self._analyze_url, args=(url,), daemon=True)
+        thread.start()
+
+    def _analyze_url(self, url):
+        try:
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+
+            is_music = is_youtube_music_url(url) or is_youtube_music_info(info)
+
+            formats = info.get("formats") or []
+            heights = collect_video_heights(formats)
+
+            result = {
+                "ok": True,
+                "is_music": is_music,
+                "heights": heights,
+                "video_options": build_video_quality_options(heights),
+                "audio_options": build_audio_quality_options(),
+                "title": info.get("title") or "Título desconhecido",
+            }
+            self.analysis_queue.put(result)
+        except Exception as e:
+            self.analysis_queue.put({"ok": False, "error": str(e)})
+
+    def check_analysis_queue(self):
+        try:
+            while True:
+                result = self.analysis_queue.get_nowait()
+                self._apply_analysis_result(result)
+        except queue.Empty:
+            pass
+        finally:
+            self.after(100, self.check_analysis_queue)
+
+    def _apply_analysis_result(self, result):
+        self.analyzing = False
+        self.analyze_button.configure(state="normal", text="Analisar Link")
+
+        if not result.get("ok"):
+            self.update_status(f"Falha ao analisar link: {result.get('error')}", is_error=True)
+            self.type_switch.configure(state="disabled")
+            self.quality_combobox.configure(state="disabled", values=["Falha na análise"])
+            self.quality_combobox.set("Falha na análise")
+            self.download_button.configure(state="disabled")
+            return
+
+        self.video_formats = result.get("video_options") or []
+        self.audio_formats = result.get("audio_options") or []
+
+        if result.get("is_music"):
+            self.type_var.set("Áudio")
+            self.update_status(f"YouTube Music detectado: {result.get('title')}. Modo Áudio ativado.")
+        else:
+            self.type_var.set("Vídeo")
+            self.update_status(f"Link analisado: {result.get('title')}")
+
+        self.type_switch.configure(state="normal")
+        self._on_type_changed()
+
+    def _on_type_changed(self, *args):
+        media_type = self.type_var.get()
+        if media_type == "Áudio":
+            options = self.audio_formats or []
+        else:
+            options = self.video_formats or []
+
+        if not options:
+            options = ["Nenhuma opção disponível"]
+
+        self.quality_combobox.configure(values=options)
+        self.quality_combobox.set(options[0] if options else "Nenhuma opção disponível")
+        self.quality_combobox.configure(state="normal")
+        self.download_button.configure(state="normal")
+
     def toggle_download(self):
         if self.downloading:
             self.cancel_event.set()
@@ -358,6 +509,10 @@ class YouTubeDownloaderApp(ctk.CTk):
 
         if not os.path.isdir(directory):
             self.update_status("Erro: pasta de destino não existe.", is_error=True)
+            return
+
+        if quality in ("Aguardando análise...", "Analisando...", "Falha na análise", "Nenhuma opção disponível"):
+            self.update_status("Erro: analise o link antes de baixar.", is_error=True)
             return
 
         save_last_directory(directory)
@@ -388,22 +543,32 @@ class YouTubeDownloaderApp(ctk.CTk):
         }
 
         if media_type == "Áudio":
+            bitrate = 192
+            m = re.search(r"(\d+)\s*kbps", quality or "")
+            if m:
+                bitrate = int(m.group(1))
             ydl_opts.update({
                 'format': 'bestaudio/best',
                 'postprocessors': [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredquality': str(bitrate),
                 }],
             })
         else:
-            height_map = {"Melhor": None, "1080p": 1080, "720p": 720, "480p": 480, "360p": 360}
-            target_height = height_map.get(quality)
-
-            if target_height:
-                ydl_opts['format'] = f'bestvideo[height<={target_height}]+bestaudio/best[height<={target_height}]'
+            m = re.match(r"(MP4|AVI)\s*-\s*(\d+)p", quality or "")
+            if m:
+                container = m.group(1).lower()
+                height = int(m.group(2))
+                ydl_opts['format'] = f'bestvideo[height<={height}]+bestaudio/best[height<={height}]'
+                ydl_opts['merge_output_format'] = container
+                ydl_opts['postprocessors'] = [{
+                    'key': 'FFmpegVideoConvertor',
+                    'preferedformat': container,
+                }]
             else:
                 ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                ydl_opts['merge_output_format'] = 'mp4'
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
