@@ -14,12 +14,6 @@ from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
 
-EXTRACTOR_ARGS = {
-    'youtube': {
-        'player_client': ['web_safari', 'android', 'tv', 'mweb']
-    }
-}
-
 PLAYLIST_DEFAULT_HEIGHTS = [1080, 720, 480, 360]
 
 
@@ -457,7 +451,6 @@ class YouTubeDownloaderApp(ctk.CTk):
                 'no_warnings': True,
                 'skip_download': True,
                 'extract_flat': 'in_playlist',
-                'extractor_args': EXTRACTOR_ARGS,
                 'force_ipv4': True,
             }
             with yt_dlp.YoutubeDL(flat_opts) as ydl:
@@ -484,7 +477,6 @@ class YouTubeDownloaderApp(ctk.CTk):
                                 'quiet': True,
                                 'no_warnings': True,
                                 'skip_download': True,
-                                'extractor_args': EXTRACTOR_ARGS,
                                 'force_ipv4': True,
                             }
                             with yt_dlp.YoutubeDL(single_opts) as ydl2:
@@ -684,7 +676,6 @@ class YouTubeDownloaderApp(ctk.CTk):
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
-            'extractor_args': EXTRACTOR_ARGS,
             'force_ipv4': True,
             'sleep_interval': 2,
         }
@@ -726,7 +717,6 @@ class YouTubeDownloaderApp(ctk.CTk):
                 'no_warnings': True,
                 'skip_download': True,
                 'extract_flat': 'in_playlist',
-                'extractor_args': EXTRACTOR_ARGS,
                 'force_ipv4': True,
             }
             with yt_dlp.YoutubeDL(flat_opts) as ydl:
