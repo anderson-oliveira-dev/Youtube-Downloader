@@ -13,10 +13,14 @@ from pathlib import Path
 
 
 CONFIG_PATH = Path.home() / ".youtube_downloader_config.json"
+PROJECT_ROOT = Path(__file__).parent
 
 EXTRACTOR_ARGS = {
     'youtube': {
-        'player_client': ['web_safari', 'android', 'tv', 'mweb']
+        'player_client': ['mweb', 'tv', 'web_safari']
+    },
+    'youtubepot-bgutilscript': {
+        'server_home': str(PROJECT_ROOT / 'vendor' / 'bgutil-ytdlp-pot-provider' / 'server')
     }
 }
 
